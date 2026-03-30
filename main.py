@@ -1,13 +1,11 @@
 import io
 import os
-import re
-import math
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
 from supabase import create_client, Client
-from datetime import datetime, timezone
 
 
 WORLD_BANK_XLSX_URL = (
@@ -17,6 +15,7 @@ WORLD_BANK_XLSX_URL = (
 )
 
 SOURCE_ID = "wb_pinksheet_monthly"
+PARSER_VERSION = "wb_monthly_prices_v1"
 
 TARGET_COMMODITIES = {
     "Fish meal": {
@@ -39,10 +38,27 @@ TARGET_COMMODITIES = {
     },
 }
 
+SOURCE_SLA_DAYS = {
+    "wb_pinksheet_monthly": 40,
+    "graingrowers_fertiliser_report": 21,
+}
+
+SOURCE_REGISTRY_BASE = {
+    "source_id": SOURCE_ID,
+    "source_name": "World Bank Commodity Price Data - Historical Monthly",
+    "source_type": "official_dataset",
+    "source_url": WORLD_BANK_XLSX_URL,
+    "frequency_expected": "monthly",
+    "default_currency": "USD",
+    "default_unit": "metric_ton",
+    "active_flag": True,
+    "notes": "POC source for Urea, DAP, Fishmeal from Monthly Prices sheet",
+}
+
 
 def get_supabase() -> Client:
-    url = "https://wtazyqnigieqegfwnzrd.supabase.co" #os.environ["SUPABASE_URL"]
-    key = "sb_publishable_emPSv0T9QHZT4l5GwbDg1Q_UkvRotlB" #os.environ["SUPABASE_KEY"]
+    url = os.environ["SUPABASE_URL"]
+    key = os.environ["SUPABASE_KEY"]
     return create_client(url, key)
 
 
@@ -61,78 +77,170 @@ def load_monthly_prices_sheet(excel_bytes: bytes) -> pd.DataFrame:
     )
 
 
-def to_python_null(value):
-    """
-    Convert pandas/numpy missing values into Python None
-    so they can be serialized to JSON for Supabase.
-    """
-    if pd.isna(value):
-        return None
-    return value
+def json_safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    safe_df = df.copy()
+    safe_df = safe_df.astype(object)
+    safe_df = safe_df.where(pd.notnull(safe_df), None)
+    return safe_df
 
 
-def dataframe_to_records(df: pd.DataFrame) -> list[dict]:
-    """
-    Convert dataframe rows into JSON-safe dicts.
-    """
-    records = df.to_dict(orient="records")
-    cleaned_records = []
-
-    for row in records:
-        cleaned_row = {}
-        for key, value in row.items():
-            cleaned_row[key] = to_python_null(value)
-        cleaned_records.append(cleaned_row)
-
-    return cleaned_records
+def ensure_source_registry_row(supabase: Client) -> None:
+    supabase.table("source_registry").upsert(
+        SOURCE_REGISTRY_BASE,
+        on_conflict="source_id",
+    ).execute()
 
 
 def mark_source_checked(supabase: Client, source_id: str, parser_version: str) -> None:
+    payload = {
+        **SOURCE_REGISTRY_BASE,
+        "source_id": source_id,
+        "last_checked_at": datetime.now(timezone.utc).isoformat(),
+        "parser_version": parser_version,
+        "run_status": "running",
+        "last_error": None,
+    }
     supabase.table("source_registry").upsert(
-        {
-            "source_id": source_id,
-            "last_checked_at": datetime.now(timezone.utc).isoformat(),
-            "parser_version": parser_version,
-            "run_status": "running",
-            "last_error": None,
-        },
+        payload,
         on_conflict="source_id",
     ).execute()
 
 
-def mark_source_success(
+def mark_source_success(supabase: Client, source_id: str, row_count: int) -> None:
+    now_utc = datetime.now(timezone.utc).isoformat()
+    payload = {
+        **SOURCE_REGISTRY_BASE,
+        "source_id": source_id,
+        "last_checked_at": now_utc,
+        "last_success_at": now_utc,
+        "parser_version": PARSER_VERSION,
+        "run_status": "success",
+        "last_row_count": row_count,
+        "last_error": None,
+    }
+    supabase.table("source_registry").upsert(
+        payload,
+        on_conflict="source_id",
+    ).execute()
+
+
+def mark_source_failed(supabase: Client, source_id: str, error_message: str) -> None:
+    payload = {
+        **SOURCE_REGISTRY_BASE,
+        "source_id": source_id,
+        "last_checked_at": datetime.now(timezone.utc).isoformat(),
+        "parser_version": PARSER_VERSION,
+        "run_status": "failed",
+        "last_error": error_message[:2000],
+    }
+    supabase.table("source_registry").upsert(
+        payload,
+        on_conflict="source_id",
+    ).execute()
+
+
+def create_run_log_start(
     supabase: Client,
     source_id: str,
+    parser_version: str,
+) -> int:
+    payload = {
+        "source_id": source_id,
+        "parser_version": parser_version,
+        "run_started_at": datetime.now(timezone.utc).isoformat(),
+        "run_status": "running",
+    }
+    response = supabase.table("source_run_log").insert(payload).execute()
+    run_row = response.data[0]
+    return run_row["id"]
+
+
+def update_run_log_success(
+    supabase: Client,
+    run_log_id: int,
     row_count: int,
 ) -> None:
-    now_utc = datetime.now(timezone.utc).isoformat()
-    supabase.table("source_registry").upsert(
-        {
-            "source_id": source_id,
-            "last_checked_at": now_utc,
-            "last_success_at": now_utc,
-            "run_status": "success",
-            "last_row_count": row_count,
-            "last_error": None,
-        },
-        on_conflict="source_id",
-    ).execute()
+    payload = {
+        "run_finished_at": datetime.now(timezone.utc).isoformat(),
+        "run_status": "success",
+        "row_count": row_count,
+        "error_message": None,
+    }
+    supabase.table("source_run_log").update(payload).eq("id", run_log_id).execute()
 
 
-def mark_source_failed(
+def update_run_log_failed(
     supabase: Client,
-    source_id: str,
+    run_log_id: int,
     error_message: str,
 ) -> None:
-    supabase.table("source_registry").upsert(
-        {
-            "source_id": source_id,
-            "last_checked_at": datetime.now(timezone.utc).isoformat(),
-            "run_status": "failed",
-            "last_error": error_message[:2000],
-        },
+    payload = {
+        "run_finished_at": datetime.now(timezone.utc).isoformat(),
+        "run_status": "failed",
+        "error_message": error_message[:2000],
+    }
+    supabase.table("source_run_log").update(payload).eq("id", run_log_id).execute()
+
+
+def compute_freshness_status(last_success_at, sla_days: int) -> tuple[str, Optional[int], str]:
+    if last_success_at is None:
+        return "failed", None, "No successful run recorded."
+
+    now = datetime.now(timezone.utc)
+    age_days = (now - last_success_at).days
+
+    if age_days <= sla_days:
+        return "fresh", age_days, f"Latest successful run is within SLA ({sla_days} days)."
+
+    return "stale", age_days, f"Latest successful run is older than SLA ({sla_days} days)."
+
+
+def upsert_freshness_status(
+    supabase: Client,
+    source_id: str,
+    last_success_at,
+) -> None:
+    sla_days = SOURCE_SLA_DAYS.get(source_id, 30)
+    freshness_status, age_days, note = compute_freshness_status(last_success_at, sla_days)
+
+    payload = {
+        "source_id": source_id,
+        "freshness_status": freshness_status,
+        "freshness_checked_at": datetime.now(timezone.utc).isoformat(),
+        "last_success_at": last_success_at.isoformat() if last_success_at is not None else None,
+        "sla_days": sla_days,
+        "age_days": age_days,
+        "note": note,
+    }
+
+    supabase.table("source_freshness_status").upsert(
+        payload,
         on_conflict="source_id",
     ).execute()
+
+
+def refresh_source_freshness_from_registry(supabase: Client, source_id: str) -> None:
+    response = (
+        supabase.table("source_registry")
+        .select("source_id,last_success_at")
+        .eq("source_id", source_id)
+        .execute()
+    )
+
+    rows = response.data or []
+    if not rows:
+        raise ValueError(f"Source {source_id} not found in source_registry.")
+
+    row = rows[0]
+    last_success_at = row.get("last_success_at")
+
+    parsed_last_success = None
+    if last_success_at:
+        parsed_last_success = pd.to_datetime(last_success_at).to_pydatetime()
+        if parsed_last_success.tzinfo is None:
+            parsed_last_success = parsed_last_success.replace(tzinfo=timezone.utc)
+
+    upsert_freshness_status(supabase, source_id, parsed_last_success)
 
 
 def parse_world_bank_monthly_prices(raw_df: pd.DataFrame) -> pd.DataFrame:
@@ -200,6 +308,7 @@ def parse_world_bank_monthly_prices(raw_df: pd.DataFrame) -> pd.DataFrame:
         subset["observed_month"] = pd.to_datetime(
             subset["month_key"].str.replace(r"^(\d{4})M(\d{2})$", r"\1-\2-01", regex=True)
         )
+        subset["report_date"] = subset["observed_month"]
 
         subset["source_id"] = SOURCE_ID
         subset["commodity_code"] = meta["commodity_code"]
@@ -220,6 +329,7 @@ def parse_world_bank_monthly_prices(raw_df: pd.DataFrame) -> pd.DataFrame:
                     "region",
                     "quality_spec",
                     "observed_month",
+                    "report_date",
                     "price_value",
                     "currency",
                     "unit",
@@ -284,75 +394,70 @@ def build_latest_snapshot(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def ensure_source_registry_row(supabase: Client) -> None:
-    row = {
-        "source_id": SOURCE_ID,
-        "source_name": "World Bank Commodity Price Data - Historical Monthly",
-        "source_type": "official_dataset",
-        "source_url": WORLD_BANK_XLSX_URL,
-        "frequency_expected": "monthly",
-        "default_currency": "USD",
-        "default_unit": "metric_ton",
-        "active_flag": True,
-        "notes": "POC source for Urea, DAP, Fishmeal from Monthly Prices sheet",
-    }
-    supabase.table("source_registry").upsert(row, on_conflict="source_id").execute()
-
-
 def main() -> None:
     supabase = get_supabase()
     ensure_source_registry_row(supabase)
+    mark_source_checked(supabase, SOURCE_ID, PARSER_VERSION)
 
-    excel_bytes = download_excel(WORLD_BANK_XLSX_URL)
-    raw_df = load_monthly_prices_sheet(excel_bytes)
-    normalized_df = parse_world_bank_monthly_prices(raw_df)
+    run_log_id = create_run_log_start(supabase, SOURCE_ID, PARSER_VERSION)
 
-    print(normalized_df.head().to_string())
-    print(normalized_df.tail().to_string())
-    print(normalized_df.groupby("commodity_code").size())
+    try:
+        excel_bytes = download_excel(WORLD_BANK_XLSX_URL)
+        raw_df = load_monthly_prices_sheet(excel_bytes)
+        normalized_df = parse_world_bank_monthly_prices(raw_df)
 
-    normalized_export_df = normalized_df.copy()
-    normalized_export_df["observed_month"] = normalized_export_df["observed_month"].dt.strftime("%Y-%m-%d")
-    normalized_rows = dataframe_to_records(normalized_export_df)
+        normalized_export_df = normalized_df.copy()
+        normalized_export_df["observed_month"] = normalized_export_df["observed_month"].dt.strftime("%Y-%m-%d")
+        normalized_export_df["report_date"] = normalized_export_df["report_date"].dt.strftime("%Y-%m-%d")
+        normalized_export_df = json_safe_dataframe(normalized_export_df)
+        normalized_rows = normalized_export_df.to_dict(orient="records")
 
-    print(normalized_df[normalized_df["commodity_code"] == "fishmeal"].tail(5).to_string())
-    print(normalized_df[normalized_df["commodity_code"] == "dap"].tail(5).to_string())
-    print(normalized_df[normalized_df["commodity_code"] == "urea"].tail(5).to_string())
+        upsert_rows(
+            supabase,
+            "commodity_prices_normalized",
+            normalized_rows,
+            on_conflict="source_id,commodity_code,region,report_date",
+        )
 
-    upsert_rows(
-        supabase,
-        "commodity_prices_normalized",
-        normalized_rows,
-        on_conflict="source_id,commodity_code,observed_month",
-    )
+        monthly_chart_df = build_chart_monthly(normalized_df)
+        monthly_chart_export_df = monthly_chart_df.copy()
+        monthly_chart_export_df["observed_month"] = monthly_chart_export_df["observed_month"].dt.strftime("%Y-%m-%d")
+        monthly_chart_export_df = json_safe_dataframe(monthly_chart_export_df)
+        monthly_chart_rows = monthly_chart_export_df.to_dict(orient="records")
 
-    monthly_chart_df = build_chart_monthly(normalized_df)
-    monthly_chart_export_df = monthly_chart_df.copy()
-    monthly_chart_export_df["observed_month"] = monthly_chart_export_df["observed_month"].dt.strftime("%Y-%m-%d")
-    monthly_chart_rows = dataframe_to_records(monthly_chart_export_df)
+        upsert_rows(
+            supabase,
+            "chart_fertilizer_vs_fishmeal_monthly",
+            monthly_chart_rows,
+            on_conflict="observed_month",
+        )
 
-    upsert_rows(
-        supabase,
-        "chart_fertilizer_vs_fishmeal_monthly",
-        monthly_chart_rows,
-        on_conflict="observed_month",
-    )
+        latest_snapshot_df = build_latest_snapshot(normalized_df)
+        latest_snapshot_export_df = latest_snapshot_df.copy()
+        latest_snapshot_export_df["latest_month"] = latest_snapshot_export_df["latest_month"].dt.strftime("%Y-%m-%d")
+        latest_snapshot_export_df = json_safe_dataframe(latest_snapshot_export_df)
+        latest_snapshot_rows = latest_snapshot_export_df.to_dict(orient="records")
 
-    latest_snapshot_df = build_latest_snapshot(normalized_df)
-    latest_snapshot_export_df = latest_snapshot_df.copy()
-    latest_snapshot_export_df["latest_month"] = latest_snapshot_export_df["latest_month"].dt.strftime("%Y-%m-%d")
-    latest_snapshot_rows = dataframe_to_records(latest_snapshot_export_df)
+        upsert_rows(
+            supabase,
+            "chart_latest_snapshot",
+            latest_snapshot_rows,
+            on_conflict="commodity_code",
+        )
 
-    upsert_rows(
-        supabase,
-        "chart_latest_snapshot",
-        latest_snapshot_rows,
-        on_conflict="commodity_code",
-    )
+        mark_source_success(supabase, SOURCE_ID, len(normalized_rows))
+        update_run_log_success(supabase, run_log_id, len(normalized_rows))
+        refresh_source_freshness_from_registry(supabase, SOURCE_ID)
 
-    print(f"Loaded {len(normalized_rows)} normalized rows")
-    print(f"Loaded {len(monthly_chart_rows)} monthly chart rows")
-    print(f"Loaded {len(latest_snapshot_rows)} latest snapshot rows")
+        print(f"Loaded {len(normalized_rows)} normalized rows")
+        print(f"Loaded {len(monthly_chart_rows)} monthly chart rows")
+        print(f"Loaded {len(latest_snapshot_rows)} latest snapshot rows")
+
+    except Exception as exc:
+        mark_source_failed(supabase, SOURCE_ID, str(exc))
+        update_run_log_failed(supabase, run_log_id, str(exc))
+        refresh_source_freshness_from_registry(supabase, SOURCE_ID)
+        raise
 
 
 if __name__ == "__main__":
